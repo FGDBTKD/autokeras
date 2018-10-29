@@ -1,26 +1,15 @@
+import csv
 import os
-import sys
 import pickle
-from copy import deepcopy
+import sys
+import tempfile
+import zipfile
 
+import imageio
+import requests
 import torch
 
-from torch.utils.data import DataLoader
-
 from autokeras.constant import Constant
-
-
-def lr_schedule(epoch):
-    lr = 1e-3
-    if epoch > 180:
-        lr *= 0.5e-3
-    elif epoch > 160:
-        lr *= 1e-3
-    elif epoch > 120:
-        lr *= 1e-2
-    elif epoch > 80:
-        lr *= 1e-1
-    return lr
 
 
 class NoImprovementError(Exception):
@@ -37,7 +26,6 @@ class EarlyStop:
         self._max_no_improvement_num = max_no_improvement_num
         self._done = False
         self._min_loss_dec = min_loss_dec
-        self.max_accuracy = 0
 
     def on_train_begin(self):
         self.training_losses = []
@@ -62,111 +50,6 @@ class EarlyStop:
         return True
 
 
-class ModelTrainer:
-    """A class that is used to train the model.
-
-    This class can train a model with dataset and will not stop until getting the minimum loss.
-
-    Attributes:
-        model: The model that will be trained
-        train_data: Training data wrapped in batches.
-        test_data: Testing data wrapped in batches.
-        verbose: Verbosity mode.
-    """
-
-    def __init__(self, model, train_data, test_data, verbose):
-        """Init the ModelTrainer with `model`, `x_train`, `y_train`, `x_test`, `y_test`, `verbose`"""
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.model = model
-        self.model.to(self.device)
-        self.verbose = verbose
-        self.train_data = train_data
-        self.test_data = test_data
-        self.criterion = torch.nn.NLLLoss()
-        self.optimizer = None
-        self.early_stop = None
-
-    def train_model(self,
-                    max_iter_num=None,
-                    max_no_improvement_num=None,
-                    batch_size=None):
-        """Train the model.
-
-        Args:
-            max_iter_num: An integer. The maximum number of epochs to train the model.
-                The training will stop when this number is reached.
-            max_no_improvement_num: An integer. The maximum number of epochs when the loss value doesn't decrease.
-                The training will stop when this number is reached.
-            batch_size: An integer. The batch size during the training.
-        """
-        if max_iter_num is None:
-            max_iter_num = Constant.MAX_ITER_NUM
-
-        if max_no_improvement_num is None:
-            max_no_improvement_num = Constant.MAX_NO_IMPROVEMENT_NUM
-
-        if batch_size is None:
-            batch_size = Constant.MAX_BATCH_SIZE
-        batch_size = min(len(self.train_data), batch_size)
-
-        train_loader = DataLoader(self.train_data, batch_size=batch_size, shuffle=True)
-        test_loader = DataLoader(self.test_data, batch_size=batch_size, shuffle=True)
-
-        self.early_stop = EarlyStop(max_no_improvement_num)
-        self.early_stop.on_train_begin()
-
-        test_accuracy_list = []
-        test_loss_list = []
-        self.optimizer = torch.optim.Adam(self.model.parameters())
-        for epoch in range(max_iter_num):
-            self._train(train_loader, epoch)
-            test_loss, accuracy = self._test(test_loader)
-            test_accuracy_list.append(accuracy)
-            test_loss_list.append(test_loss)
-            if self.verbose:
-                print('Epoch {}: loss {}, accuracy {}'.format(epoch + 1, test_loss, accuracy))
-            decreasing = self.early_stop.on_epoch_end(test_loss)
-            if not decreasing:
-                if self.verbose:
-                    print('No loss decrease after {} epochs'.format(max_no_improvement_num))
-                break
-        return (sum(test_loss_list[-max_no_improvement_num:]) / max_no_improvement_num,
-                sum(test_accuracy_list[-max_no_improvement_num:]) / max_no_improvement_num)
-
-    def _train(self, loader, epoch):
-        self.model.train()
-
-        for batch_idx, (inputs, targets) in enumerate(deepcopy(loader)):
-            targets = targets.argmax(1)
-            inputs, targets = inputs.to(self.device), targets.to(self.device)
-            self.optimizer.zero_grad()
-            outputs = self.model(inputs)
-            loss = torch.nn.functional.nll_loss(outputs, targets)
-            loss.backward()
-            self.optimizer.step()
-            if self.verbose:
-                if batch_idx % 10 == 0:
-                    print('.', end='')
-                    sys.stdout.flush()
-        if self.verbose:
-            print()
-
-    def _test(self, test_loader):
-        self.model.eval()
-        test_loss = 0
-        correct = 0
-        with torch.no_grad():
-            for batch_idx, (inputs, targets) in enumerate(deepcopy(test_loader)):
-                targets = targets.argmax(1)
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
-                outputs = self.model(inputs)
-                test_loss += self.criterion(outputs, targets)
-
-                _, predicted = outputs.max(1)
-                correct += predicted.eq(targets).sum().item()
-        return test_loss, correct * 100.0 / len(test_loader.dataset)
-
-
 def ensure_dir(directory):
     """Create directory if it does not exist"""
     if not os.path.exists(directory):
@@ -188,3 +71,129 @@ def pickle_from_file(path):
 
 def pickle_to_file(obj, path):
     pickle.dump(obj, open(path, 'wb'))
+
+
+def get_device():
+    """ If Cuda is available, use Cuda device, else use CPU device
+        When choosing from Cuda devices, this function will choose the one with max memory available
+
+    Returns: string device name
+
+    """
+    # TODO: could use gputil in the future
+    device = 'cpu'
+    if torch.cuda.is_available():
+        smi_out = os.popen('nvidia-smi -q -d Memory | grep -A4 GPU|grep Free').read()
+        # smi_out=
+        #       Free                 : xxxxxx MiB
+        #       Free                 : xxxxxx MiB
+        #                      ....
+        visible_devices = os.getenv('CUDA_VISIBLE_DEVICES', '').split(',')
+        if len(visible_devices) == 1 and visible_devices[0] == '':
+            visible_devices = []
+        visible_devices = [int(x) for x in visible_devices]
+        memory_available = [int(x.split()[2]) for x in smi_out.splitlines()]
+        for cuda_index, _ in enumerate(memory_available):
+            if cuda_index not in visible_devices and visible_devices:
+                memory_available[cuda_index] = 0
+
+        if memory_available:
+            if max(memory_available) != 0:
+                device = 'cuda:' + str(memory_available.index(max(memory_available)))
+    return device
+
+
+def temp_folder_generator():
+    # return '/home/linyang/temp'
+    sys_temp = tempfile.gettempdir()
+    path = os.path.join(sys_temp, 'autokeras')
+    ensure_dir(path)
+    return path
+
+
+def download_file(file_link, file_path):
+    if not os.path.exists(file_path):
+        with open(file_path, "wb") as f:
+            print("Downloading %s" % file_path)
+            response = requests.get(file_link, stream=True)
+            total_length = response.headers.get('content-length')
+
+            if total_length is None:  # no content length header
+                f.write(response.content)
+            else:
+                dl = 0
+                total_length = int(total_length)
+                for data in response.iter_content(chunk_size=4096):
+                    dl += len(data)
+                    f.write(data)
+                    done = int(50 * dl / total_length)
+                    sys.stdout.write("\r[%s%s]" % ('=' * done, ' ' * (50 - done)))
+                    sys.stdout.flush()
+
+
+def download_file_with_extract(file_link, file_path, extract_path):
+    if not os.path.exists(extract_path):
+        download_file(file_link, file_path)
+        zip_ref = zipfile.ZipFile(file_path, 'r')
+        print("extracting downloaded file...")
+        zip_ref.extractall(extract_path)
+        os.remove(file_path)
+        print("extracted and removed downloaded zip file")
+    print("file already extracted in the path %s" % extract_path)
+
+
+def verbose_print(new_father_id, new_graph):
+    cell_size = [24, 49]
+    header = ['Father Model ID', 'Added Operation']
+    line = '|'.join(str(x).center(cell_size[i]) for i, x in enumerate(header))
+    print('\n' + '+' + '-' * len(line) + '+')
+    print('|' + line + '|')
+    print('+' + '-' * len(line) + '+')
+    for i in range(len(new_graph.operation_history)):
+        if i == len(new_graph.operation_history) // 2:
+            r = [new_father_id, new_graph.operation_history[i]]
+        else:
+            r = [' ', new_graph.operation_history[i]]
+        line = '|'.join(str(x).center(cell_size[i]) for i, x in enumerate(r))
+        print('|' + line + '|')
+    print('+' + '-' * len(line) + '+')
+
+
+def validate_xy(x_train, y_train):
+    """Check `x_train`'s type and the shape of `x_train`, `y_train`."""
+    try:
+        x_train = x_train.astype('float64')
+    except ValueError:
+        raise ValueError('x_train should only contain numerical data.')
+
+    if len(x_train.shape) < 2:
+        raise ValueError('x_train should at least has 2 dimensions.')
+
+    if x_train.shape[0] != y_train.shape[0]:
+        raise ValueError('x_train and y_train should have the same number of instances.')
+
+
+def read_csv_file(csv_file_path):
+    """Read the csv file and returns two separate list containing files name and their labels.
+
+    Args:
+        csv_file_path: Path to the CSV file.
+
+    Returns:
+        file_names: List containing files names.
+        file_label: List containing their respective labels.
+    """
+    file_names = []
+    file_labels = []
+    with open(csv_file_path, 'r') as files_path:
+        path_list = csv.DictReader(files_path)
+        fieldnames = path_list.fieldnames
+        for path in path_list:
+            file_names.append(path[fieldnames[0]])
+            file_labels.append(path[fieldnames[1]])
+    return file_names, file_labels
+
+
+def read_image(img_path):
+    img = imageio.imread(uri=img_path)
+    return img

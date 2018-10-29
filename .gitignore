@@ -1,6 +1,12 @@
+# Mkdocs
+/docs/
+/mkdocs/docs/index.md
+/mkdocs/docs/temp
+
 .DS_Store
 .idea
 .pytest_cache
+/experiments
 
 # resource temp folder
 tests/resources/temp/*
@@ -19,7 +25,6 @@ __pycache__/
 build/
 develop-eggs/
 dist/
-/docs/
 downloads/
 eggs/
 .eggs/
@@ -111,3 +116,5 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+
+examples/text_cnn/glove_embedding/

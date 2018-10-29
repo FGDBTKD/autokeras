@@ -1,9 +1,18 @@
+import random
+import time
 import warnings
+from copy import deepcopy
+from functools import total_ordering
+from queue import PriorityQueue
 
 import numpy as np
 import math
-from scipy.linalg import cholesky, cho_solve, solve_triangular
+
+from scipy.linalg import cholesky, cho_solve, solve_triangular, LinAlgError
 from scipy.optimize import linear_sum_assignment
+from sklearn.metrics.pairwise import rbf_kernel
+
+from autokeras.net_transformer import transform
 
 
 def layer_distance(a, b):
@@ -52,7 +61,6 @@ def edit_distance(x, y, kernel_lambda):
 class IncrementalGaussianProcess:
     def __init__(self, kernel_lambda):
         self.alpha = 1e-10
-        self._k_matrix = None
         self._distance_matrix = None
         self._x = None
         self._y = None
@@ -79,22 +87,25 @@ class IncrementalGaussianProcess:
         train_x, train_y = np.array(train_x), np.array(train_y)
 
         # Incrementally compute K
-        up_right_k = self.edit_distance_matrix(self.kernel_lambda, self._x, train_x)  # Shape (len(X_train_), len(train_x))
+        up_right_k = self.edit_distance_matrix(self.kernel_lambda, self._x, train_x)
         down_left_k = np.transpose(up_right_k)
         down_right_k = self.edit_distance_matrix(self.kernel_lambda, train_x)
         up_k = np.concatenate((self._distance_matrix, up_right_k), axis=1)
         down_k = np.concatenate((down_left_k, down_right_k), axis=1)
-        self._distance_matrix = np.concatenate((up_k, down_k), axis=0)
-        self._distance_matrix = bourgain_embedding_matrix(self._distance_matrix)
-        self._k_matrix = 1.0 / np.exp(self._distance_matrix)
-        diag = np.diag_indices_from(self._k_matrix)
-        diag = (diag[0][-len(train_x):], diag[1][-len(train_x):])
-        self._k_matrix[diag] += self.alpha
+        temp_distance_matrix = np.concatenate((up_k, down_k), axis=0)
+        k_matrix = bourgain_embedding_matrix(temp_distance_matrix)
+        diagonal = np.diag_indices_from(k_matrix)
+        diagonal = (diagonal[0][-len(train_x):], diagonal[1][-len(train_x):])
+        k_matrix[diagonal] += self.alpha
+
+        try:
+            self._l_matrix = cholesky(k_matrix, lower=True)  # Line 2
+        except LinAlgError:
+            return self
 
         self._x = np.concatenate((self._x, train_x), axis=0)
         self._y = np.concatenate((self._y, train_y), axis=0)
-
-        self._l_matrix = cholesky(self._k_matrix, lower=True)  # Line 2
+        self._distance_matrix = temp_distance_matrix
 
         self._alpha_vector = cho_solve((self._l_matrix, True), self._y)  # Line 3
 
@@ -111,11 +122,10 @@ class IncrementalGaussianProcess:
         self._y = np.copy(train_y)
 
         self._distance_matrix = self.edit_distance_matrix(self.kernel_lambda, self._x)
-        self._distance_matrix = bourgain_embedding_matrix(self._distance_matrix)
-        self._k_matrix = 1.0 / np.exp(self._distance_matrix)
-        self._k_matrix[np.diag_indices_from(self._k_matrix)] += self.alpha
+        k_matrix = bourgain_embedding_matrix(self._distance_matrix)
+        k_matrix[np.diag_indices_from(k_matrix)] += self.alpha
 
-        self._l_matrix = cholesky(self._k_matrix, lower=True)  # Line 2
+        self._l_matrix = cholesky(k_matrix, lower=True)  # Line 2
 
         self._alpha_vector = cho_solve((self._l_matrix, True), self._y)  # Line 3
 
@@ -123,7 +133,7 @@ class IncrementalGaussianProcess:
         return self
 
     def predict(self, train_x):
-        k_trans = 1.0 / np.exp(self.edit_distance_matrix(self.kernel_lambda, train_x, self._x))
+        k_trans = np.exp(-np.power(self.edit_distance_matrix(self.kernel_lambda, train_x, self._x), 2))
         y_mean = k_trans.dot(self._alpha_vector)  # Line 4 (y_mean = f_star)
 
         # compute inverse K_inv of K based on its Cholesky
@@ -190,8 +200,123 @@ def bourgain_embedding_matrix(distance_matrix):
                     distort_elements.append([d])
                 else:
                     distort_elements[j].append(d)
-    distort_matrix = np.zeros((n, n))
-    for i in range(n):
-        for j in range(i + 1, n):
-            distort_matrix[i][j] = distort_matrix[j][i] = vector_distance(distort_elements[i], distort_elements[j])
-    return np.array(distort_matrix)
+    return rbf_kernel(distort_elements, distort_elements)
+
+
+class BayesianOptimizer:
+    """
+
+    gpr: A GaussianProcessRegressor for bayesian optimization.
+    """
+    def __init__(self, searcher, t_min, metric, kernel_lambda, beta):
+        self.searcher = searcher
+        self.t_min = t_min
+        self.metric = metric
+        self.gpr = IncrementalGaussianProcess(kernel_lambda)
+        self.beta = beta
+
+    def fit(self, x_queue, y_queue):
+        self.gpr.fit(x_queue, y_queue)
+
+    def optimize_acq(self, model_ids, descriptors, timeout):
+        start_time = time.time()
+        target_graph = None
+        father_id = None
+        descriptors = deepcopy(descriptors)
+        elem_class = Elem
+        if self.metric.higher_better():
+            elem_class = ReverseElem
+
+        # Initialize the priority queue.
+        pq = PriorityQueue()
+        temp_list = []
+        for model_id in model_ids:
+            metric_value = self.searcher.get_metric_value_by_id(model_id)
+            temp_list.append((metric_value, model_id))
+        temp_list = sorted(temp_list)
+        for metric_value, model_id in temp_list:
+            graph = self.searcher.load_model_by_id(model_id)
+            graph.clear_operation_history()
+            graph.clear_weights()
+            pq.put(elem_class(metric_value, model_id, graph))
+
+        t = 1.0
+        t_min = self.t_min
+        alpha = 0.9
+        opt_acq = self._get_init_opt_acq_value()
+        remaining_time = timeout
+        while not pq.empty() and t > t_min and remaining_time > 0:
+            elem = pq.get()
+            if self.metric.higher_better():
+                temp_exp = min((elem.metric_value - opt_acq) / t, 1.0)
+            else:
+                temp_exp = min((opt_acq - elem.metric_value) / t, 1.0)
+            ap = math.exp(temp_exp)
+            if ap >= random.uniform(0, 1):
+                for temp_graph in transform(elem.graph):
+                    if contain(descriptors, temp_graph.extract_descriptor()):
+                        continue
+
+                    temp_acq_value = self.acq(temp_graph)
+                    pq.put(elem_class(temp_acq_value, elem.father_id, temp_graph))
+                    descriptors.append(temp_graph.extract_descriptor())
+                    if self._accept_new_acq_value(opt_acq, temp_acq_value):
+                        opt_acq = temp_acq_value
+                        father_id = elem.father_id
+                        target_graph = deepcopy(temp_graph)
+            t *= alpha
+            remaining_time = timeout - (time.time() - start_time)
+
+        if remaining_time < 0:
+            raise TimeoutError
+        # Did not found a not duplicated architecture
+        if father_id is None:
+            return None, None
+        nm_graph = self.searcher.load_model_by_id(father_id)
+        for args in target_graph.operation_history:
+            getattr(nm_graph, args[0])(*list(args[1:]))
+        return nm_graph, father_id
+
+    def acq(self, graph):
+        mean, std = self.gpr.predict(np.array([graph.extract_descriptor()]))
+        if self.metric.higher_better():
+            return mean + self.beta * std
+        return mean - self.beta * std
+
+    def _get_init_opt_acq_value(self):
+        if self.metric.higher_better():
+            return -np.inf
+        return np.inf
+
+    def _accept_new_acq_value(self, opt_acq, temp_acq_value):
+        if temp_acq_value > opt_acq and self.metric.higher_better():
+            return True
+        if temp_acq_value < opt_acq and not self.metric.higher_better():
+            return True
+        return False
+
+
+@total_ordering
+class Elem:
+    def __init__(self, metric_value, father_id, graph):
+        self.father_id = father_id
+        self.graph = graph
+        self.metric_value = metric_value
+
+    def __eq__(self, other):
+        return self.metric_value == other.metric_value
+
+    def __lt__(self, other):
+        return self.metric_value < other.metric_value
+
+
+class ReverseElem(Elem):
+    def __lt__(self, other):
+        return self.metric_value > other.metric_value
+
+
+def contain(descriptors, target_descriptor):
+    for descriptor in descriptors:
+        if edit_distance(descriptor, target_descriptor, 1) < 1e-5:
+            return True
+    return False

@@ -1,10 +1,11 @@
-import torch
-
+import os
 import numpy as np
-from torch.utils.data import Dataset
+import torch
+from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import ToPILImage, RandomCrop, RandomHorizontalFlip, ToTensor, Normalize, Compose
-
+from abc import ABC, abstractmethod
 from autokeras.constant import Constant
+from autokeras.utils import read_csv_file, read_image
 
 
 class OneHotEncoder:
@@ -51,7 +52,41 @@ class OneHotEncoder:
         return np.array(list(map(lambda x: self.int_to_label[x], np.argmax(np.array(data), axis=1))))
 
 
-class DataTransformer:
+class DataTransformer(ABC):
+    @abstractmethod
+    def transform_train(self, data, targets=None, batch_size=None):
+        raise NotImplementedError
+
+    @abstractmethod
+    def transform_test(self, data, target=None, batch_size=None):
+        raise NotImplementedError
+
+
+class TextDataTransformer(DataTransformer):
+
+    def transform_train(self, data, targets=None, batch_size=None):
+        dataset = self._transform(compose_list=[], data=data, targets=targets)
+        if batch_size is None:
+            batch_size = Constant.MAX_BATCH_SIZE
+        batch_size = min(len(data), batch_size)
+
+        return DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    def transform_test(self, data, targets=None, batch_size=None):
+        dataset = self._transform(compose_list=[], data=data, targets=targets)
+        if batch_size is None:
+            batch_size = Constant.MAX_BATCH_SIZE
+        batch_size = min(len(data), batch_size)
+
+        return DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    def _transform(self, compose_list, data, targets):
+        data = torch.Tensor(data.transpose(0, 3, 1, 2))
+        data_transforms = Compose(compose_list)
+        return MultiTransformDataset(data, targets, data_transforms)
+
+
+class ImageDataTransformer(DataTransformer):
     def __init__(self, data, augment=Constant.DATA_AUGMENTATION):
         self.max_val = data.max()
         data = data / self.max_val
@@ -59,26 +94,42 @@ class DataTransformer:
         self.std = np.std(data, axis=(0, 1, 2), keepdims=True).flatten()
         self.augment = augment
 
-    def transform_train(self, data, targets=None):
-        data = data / self.max_val
-        data = torch.Tensor(data.transpose(0, 3, 1, 2))
+    def transform_train(self, data, targets=None, batch_size=None):
         if not self.augment:
             augment_list = []
         else:
             augment_list = [ToPILImage(),
-                            RandomCrop(data.shape[2:], padding=4),
+                            RandomCrop(data.shape[1:3], padding=4),
                             RandomHorizontalFlip(),
                             ToTensor()
                             ]
         common_list = [Normalize(torch.Tensor(self.mean), torch.Tensor(self.std))]
-        data_transforms = Compose(augment_list + common_list)
-        return MultiTransformDataset(data, targets, data_transforms)
+        compose_list = augment_list + common_list
 
-    def transform_test(self, data, targets=None):
+        dataset = self._transform(compose_list, data, targets)
+
+        if batch_size is None:
+            batch_size = Constant.MAX_BATCH_SIZE
+        batch_size = min(len(data), batch_size)
+
+        return DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    def transform_test(self, data, targets=None, batch_size=None):
+        common_list = [Normalize(torch.Tensor(self.mean), torch.Tensor(self.std))]
+        compose_list = common_list
+
+        dataset = self._transform(compose_list, data, targets)
+
+        if batch_size is None:
+            batch_size = Constant.MAX_BATCH_SIZE
+        batch_size = min(len(data), batch_size)
+
+        return DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+    def _transform(self, compose_list, data, targets):
         data = data / self.max_val
         data = torch.Tensor(data.transpose(0, 3, 1, 2))
-        common_list = [Normalize(torch.Tensor(self.mean), torch.Tensor(self.std))]
-        data_transforms = Compose(common_list)
+        data_transforms = Compose(compose_list)
         return MultiTransformDataset(data, targets, data_transforms)
 
 
@@ -96,3 +147,28 @@ class MultiTransformDataset(Dataset):
 
     def __len__(self):
         return len(self.dataset)
+
+
+class BatchDataset(Dataset):
+    def __init__(self, csv_file_path, image_path, has_target=True):
+        file_names, target = read_csv_file(csv_file_path)
+
+        self.y_encoder = OneHotEncoder()
+        self.y_encoder.fit(target)
+        target = self.y_encoder.transform(target)
+
+        self.target = target
+        self.has_target = has_target
+        self.file_paths = list(map(lambda file_name: os.path.join(image_path, file_name), file_names))
+
+    def __getitem__(self, index):
+        image = read_image(self.file_paths[index])
+        if len(image.shape) < 3:
+            image = image[..., np.newaxis]
+        image = torch.Tensor(image.transpose(2, 0, 1))
+        if self.has_target:
+            return image, self.target[index]
+        return image
+
+    def __len__(self):
+        return len(self.file_paths)
