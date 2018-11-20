@@ -40,6 +40,10 @@ You can use Gitter to communicate with people who also interested in Auto-Keras.
 
 <a href="https://gitter.im/autokeras/Lobby?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge"><img src="https://badges.gitter.im/autokeras/Lobby.svg" alt="Join the chat at https://gitter.im/autokeras/Lobby" style="width: 92px"></a>
 
+You can follow us on Twitter. We will constantly post our new features and releases. Moreover, we will post new feature request for the developers from the open-source community to contribute code and documentation.
+
+<a href="https://twitter.com/autokeras" class="twitter-follow-button" data-show-count="false">Follow @autokeras</a><script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script>
+
 ## Citing this work
 
 If you use Auto-Keras in a scientific publication, you are highly encouraged (though not required) to cite the following paper:
@@ -66,10 +70,8 @@ We accept donations on [Open Collective](https://opencollective.com/autokeras).
 The money will be used to motivate the developers in the open-source community to contribute code to Auto-Keras.
 Thank every backer for supporting us!
 
-<a href="https://opencollective.com/autokeras/donate" target="_blank">
-  <img src="https://opencollective.com/autokeras/donate/button@2x.png?color=blue" width=300 />
-</a>
-
+<script src="https://opencollective.com/autokeras/banner.js">
+</script>
 
 ## DISCLAIMER
 

@@ -1,19 +1,24 @@
+from collections import Iterable
 from copy import deepcopy
-
 from queue import Queue
+
+import keras
 import numpy as np
 import torch
-import keras
 
 from autokeras.constant import Constant
-from autokeras.nn.layer_transformer import wider_bn, wider_next_conv, wider_next_dense, wider_pre_dense, wider_pre_conv, \
-    deeper_conv_block, dense_to_deeper_block, add_noise
-from autokeras.nn.layers import StubConcatenate, StubAdd, StubConv, is_layer, layer_width, \
+from autokeras.nn.layer_transformer import wider_bn, wider_next_conv, wider_next_dense, wider_pre_dense, \
+    wider_pre_conv, deeper_conv_block, dense_to_deeper_block, add_noise
+from autokeras.nn.layers import StubConcatenate, StubAdd, is_layer, layer_width, \
     to_real_keras_layer, set_torch_weight_to_stub, set_stub_weight_to_torch, set_stub_weight_to_keras, \
-    set_keras_weight_to_stub, StubBatchNormalization, StubReLU
+    set_keras_weight_to_stub, StubReLU, get_conv_class, get_batch_norm_class
 
 
 class NetworkDescriptor:
+    """A class describing the neural architecture for neural network kernel.
+
+    It only record the width of convolutional and dense layers, and the skip-connection types and positions.
+    """
     CONCAT_CONNECT = 'concat'
     ADD_CONNECT = 'add'
 
@@ -37,6 +42,14 @@ class NetworkDescriptor:
         self.dense_widths.append(width)
 
     def add_skip_connection(self, u, v, connection_type):
+        """ Add a skip-connection to the descriptor.
+
+        Args:
+            u: Number of convolutional layers before the starting point.
+            v: Number of convolutional layers before the ending point.
+            connection_type: Must be either CONCAT_CONNECT or ADD_CONNECT.
+
+        """
         if connection_type not in [self.CONCAT_CONNECT, self.ADD_CONNECT]:
             raise ValueError('connection_type should be NetworkDescriptor.CONCAT_CONNECT '
                              'or NetworkDescriptor.ADD_CONNECT.')
@@ -50,6 +63,11 @@ class NetworkDescriptor:
 
 
 class Node:
+    """A class for intermediate output tensor (node) in the Graph.
+
+    Attributes:
+        shape: A tuple describing the shape of the tensor.
+    """
     def __init__(self, shape):
         self.shape = shape
 
@@ -64,15 +82,18 @@ class Graph:
     (e.g. Add layer is adding two tensor into one tensor. So it is related to two edges.)
 
     Attributes:
-        weighted: A boolean of whether the weights and biases in the neural network
-            should be included in the graph.
-        input_shape: A tuple of integers, which does not include the batch axis.
+        input_shape: A tuple describing the input tensor shape, not including the number of instances.
+        weighted: A boolean marking if there are actual values in the weights of the layers.
+            Sometime we only need the neural architecture information with a graph. In that case,
+            we do not save the weights to save memory and time.
         node_list: A list of integers. The indices of the list are the identifiers.
         layer_list: A list of stub layers. The indices of the list are the identifiers.
         node_to_id: A dict instance mapping from node integers to their identifiers.
         layer_to_id: A dict instance mapping from stub layers to their identifiers.
         layer_id_to_input_node_ids: A dict instance mapping from layer identifiers
             to their input nodes identifiers.
+        layer_id_to_output_node_ids: A dict instance mapping from layer identifiers
+            to their output nodes identifiers.
         adj_list: A two dimensional list. The adjacency list of the graph. The first dimension is
             identified by tensor identifiers. In each edge list, the elements are two-element tuples
             of (tensor identifier, layer identifier).
@@ -83,6 +104,15 @@ class Graph:
     """
 
     def __init__(self, input_shape, weighted=True):
+        """Initializer for Graph.
+
+        Args:
+            input_shape: A tuple describing the input tensor shape, not including the number of instances.
+            weighted: A boolean marking if there are actual values in the weights of the layers.
+                Sometime we only need the neural architecture information with a graph. In that case,
+                we do not save the weights to save memory and time.
+        """
+        self.input_shape = input_shape
         self.weighted = weighted
         self.node_list = []
         self.layer_list = []
@@ -94,12 +124,24 @@ class Graph:
         self.adj_list = {}
         self.reverse_adj_list = {}
         self.operation_history = []
+        self.n_dim = len(input_shape) - 1
+        self.conv = get_conv_class(self.n_dim)
+        self.batch_norm = get_batch_norm_class(self.n_dim)
 
         self.vis = None
         self._add_node(Node(input_shape))
 
     def add_layer(self, layer, input_node_id):
-        if isinstance(input_node_id, list):
+        """Add a layer to the Graph.
+
+        Args:
+            layer: An instance of the subclasses of StubLayer in layers.py.
+            input_node_id: An integer. The ID of the input node of the layer.
+
+        Returns:
+            output_node_id: An integer. The ID of the output node of the layer.
+        """
+        if isinstance(input_node_id, Iterable):
             layer.input = list(map(lambda x: self.node_list[x], input_node_id))
             output_node_id = self._add_node(Node(layer.output_shape))
             for node_id in input_node_id:
@@ -127,7 +169,14 @@ class Graph:
         return len(self.layer_list)
 
     def _add_node(self, node):
-        """Add node to node list if it is not in node list."""
+        """Add a new node to node_list and give the node an ID.
+
+        Args:
+            node: An instance of Node.
+
+        Returns:
+            node_id: An integer.
+        """
         node_id = len(self.node_list)
         self.node_to_id[node] = node_id
         self.node_list.append(node)
@@ -136,7 +185,7 @@ class Graph:
         return node_id
 
     def _add_edge(self, layer, input_id, output_id):
-        """Add an edge to the graph."""
+        """Add a new layer to the graph. The nodes should be created in advance."""
 
         if layer in self.layer_to_id:
             layer_id = self.layer_to_id[layer]
@@ -155,7 +204,8 @@ class Graph:
         self.reverse_adj_list[output_id].append((input_id, layer_id))
 
     def _redirect_edge(self, u_id, v_id, new_v_id):
-        """Redirect the edge to a new node.
+        """Redirect the layer to a new node.
+
         Change the edge originally from `u_id` to `v_id` into an edge from `u_id` to `new_v_id`
         while keeping all other property of the edge the same.
         """
@@ -189,7 +239,7 @@ class Graph:
 
     @property
     def topological_order(self):
-        """Return the topological order of the node ids."""
+        """Return the topological order of the node IDs from the input node to the output node."""
         q = Queue()
         in_degree = {}
         for i in range(self.n_nodes):
@@ -212,12 +262,17 @@ class Graph:
         return order_list
 
     def _get_pooling_layers(self, start_node_id, end_node_id):
+        """Given two node IDs, return all the pooling layers between them."""
         layer_list = []
         node_list = [start_node_id]
         self._depth_first_search(end_node_id, layer_list, node_list)
         return filter(lambda layer_id: is_layer(self.layer_list[layer_id], 'Pooling'), layer_list)
 
     def _depth_first_search(self, target_id, layer_id_list, node_list):
+        """Search for all the layers and nodes down the path.
+
+        A recursive function to search all the layers and nodes between the node in the node_list
+            and the node with target_id."""
         u = node_list[-1]
         if u == target_id:
             return True
@@ -233,10 +288,13 @@ class Graph:
         return False
 
     def _search(self, u, start_dim, total_dim, n_add):
-        """Search the graph for widening the layers.
+        """Search the graph for all the layers to be widened caused by an operation.
+
+        It is an recursive function with duplication check to avoid deadlock.
+        It searches from a starting node u until the corresponding layers has been widened.
 
         Args:
-            u: The starting node identifier.
+            u: The starting node ID.
             start_dim: The position to insert the additional dimensions.
             total_dim: The total number of dimensions the layer has before widening.
             n_add: The number of dimensions to add.
@@ -345,16 +403,17 @@ class Graph:
 
         self._insert_new_layers(new_layers, output_id)
 
-    def _insert_new_layers(self, new_layers, output_id):
-        new_node_id = self._add_node(deepcopy(self.node_list[self.adj_list[output_id][0][0]]))
+    def _insert_new_layers(self, new_layers, start_node_id):
+        """Insert the new_layers after the node with start_node_id."""
+        new_node_id = self._add_node(deepcopy(self.node_list[self.adj_list[start_node_id][0][0]]))
         temp_output_id = new_node_id
         for layer in new_layers[:-1]:
             temp_output_id = self.add_layer(layer, temp_output_id)
 
-        self._add_edge(new_layers[-1], temp_output_id, self.adj_list[output_id][0][0])
+        self._add_edge(new_layers[-1], temp_output_id, self.adj_list[start_node_id][0][0])
         new_layers[-1].input = self.node_list[temp_output_id]
-        new_layers[-1].output = self.node_list[self.adj_list[output_id][0][0]]
-        self._redirect_edge(output_id, self.adj_list[output_id][0][0], new_node_id)
+        new_layers[-1].output = self.node_list[self.adj_list[start_node_id][0][0]]
+        self._redirect_edge(start_node_id, self.adj_list[start_node_id][0][0], new_node_id)
 
     def _block_end_node(self, layer_id, block_size):
         ret = self.layer_id_to_output_node_ids[layer_id][0]
@@ -396,9 +455,9 @@ class Graph:
         # Add the conv layer
         new_relu_layer = StubReLU()
         skip_output_id = self.add_layer(new_relu_layer, skip_output_id)
-        new_conv_layer = StubConv(self.layer_list[start_id].filters, self.layer_list[end_id].filters, 1)
+        new_conv_layer = self.conv(self.layer_list[start_id].filters, self.layer_list[end_id].filters, 1)
         skip_output_id = self.add_layer(new_conv_layer, skip_output_id)
-        new_bn_layer = StubBatchNormalization(self.layer_list[end_id].filters)
+        new_bn_layer = self.batch_norm(self.layer_list[end_id].filters)
         skip_output_id = self.add_layer(new_bn_layer, skip_output_id)
 
         # Add the add layer.
@@ -417,7 +476,7 @@ class Graph:
         if self.weighted:
             filters_end = self.layer_list[end_id].filters
             filters_start = self.layer_list[start_id].filters
-            filter_shape = (1,) * (len(self.layer_list[end_id].get_weights()[0].shape) - 2)
+            filter_shape = (1,) * self.n_dim
             weights = np.zeros((filters_end, filters_start) + filter_shape)
             bias = np.zeros(filters_end)
             new_conv_layer.set_weights((add_noise(weights, np.array([0, 1])), add_noise(bias, np.array([0, 1]))))
@@ -463,10 +522,10 @@ class Graph:
         # Add the concatenate layer.
         new_relu_layer = StubReLU()
         concat_output_node_id = self.add_layer(new_relu_layer, concat_output_node_id)
-        new_conv_layer = StubConv(self.layer_list[start_id].filters + self.layer_list[end_id].filters,
-                                  self.layer_list[end_id].filters, 1)
+        new_conv_layer = self.conv(self.layer_list[start_id].filters + self.layer_list[end_id].filters,
+                                   self.layer_list[end_id].filters, 1)
         concat_output_node_id = self.add_layer(new_conv_layer, concat_output_node_id)
-        new_bn_layer = StubBatchNormalization(self.layer_list[end_id].filters)
+        new_bn_layer = self.batch_norm(self.layer_list[end_id].filters)
 
         self._add_edge(new_bn_layer, concat_output_node_id, block_last_layer_output_id)
         new_bn_layer.input = self.node_list[concat_output_node_id]
@@ -476,11 +535,12 @@ class Graph:
         if self.weighted:
             filters_end = self.layer_list[end_id].filters
             filters_start = self.layer_list[start_id].filters
-            filter_shape = (1,) * (len(self.layer_list[end_id].get_weights()[0].shape) - 2)
+            filter_shape = (1,) * self.n_dim
             weights = np.zeros((filters_end, filters_end) + filter_shape)
             for i in range(filters_end):
                 filter_weight = np.zeros((filters_end,) + filter_shape)
-                filter_weight[(i, 0, 0)] = 1
+                center_index = (i,) + (0,) * self.n_dim
+                filter_weight[center_index] = 1
                 weights[i, ...] = filter_weight
             weights = np.concatenate((weights,
                                       np.zeros((filters_end, filters_start) + filter_shape)), axis=1)
@@ -495,6 +555,7 @@ class Graph:
             new_bn_layer.set_weights(new_weights)
 
     def extract_descriptor(self):
+        """Extract the the description of the Graph as an instance of NetworkDescriptor."""
         ret = NetworkDescriptor()
         topological_node_list = self.topological_order
         for u in topological_node_list:
@@ -536,7 +597,7 @@ class Graph:
             layer.weights = None
 
     def produce_model(self):
-        """Build a new model based on the current graph."""
+        """Build a new torch model based on the current graph."""
         return TorchModel(self)
 
     def produce_keras_model(self):
@@ -576,6 +637,7 @@ class Graph:
 
 
 class TorchModel(torch.nn.Module):
+    """A neural network class using pytorch constructed from an instance of Graph."""
     def __init__(self, graph):
         super(TorchModel, self).__init__()
         self.graph = graph
